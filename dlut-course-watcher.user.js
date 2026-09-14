@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DLUT Course Watcher
 // @namespace    local.dlut.course-watcher
-// @version      2.3.0
+// @version      2.4.0
 // @description  仅在用户手动登录后的选课页面中监测和串行提交课程
 // @match        https://dutgs.dlut.edu.cn/pyxx/*
 // @grant        none
@@ -119,7 +119,7 @@
   }
 
   function shouldAutoDismissAlert(running, reason) {
-    return running === true && reason != null;
+    return reason != null;
   }
 
   function normalizeExclusionRules(value = '') {
@@ -923,7 +923,7 @@
         writeLog(`自动确认：${String(message)}`);
         return true;
       }
-      if (shouldAutoDismissAlert(state.running, reason)) {
+      if (state.running && shouldAutoDismissAlert(state.running, reason)) {
         handleKnownFeedback(reason);
         return true;
       }
