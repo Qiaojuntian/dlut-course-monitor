@@ -1,0 +1,14 @@
+{
+  "name": "dlut-course-watcher",
+  "version": "2.1.0",
+  "private": false,
+  "description": "大连理工大学研究生选课页面的本地监测用户脚本",
+  "scripts": {
+    "build": "node scripts/build-user-script.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
