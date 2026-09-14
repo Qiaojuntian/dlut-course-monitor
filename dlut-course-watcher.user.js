@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DLUT Course Watcher
 // @namespace    local.dlut.course-watcher
-// @version      2.1.0
+// @version      2.3.0
 // @description  仅在用户手动登录后的选课页面中监测和串行提交课程
 // @match        https://dutgs.dlut.edu.cn/pyxx/*
 // @grant        none
@@ -110,7 +110,7 @@
     if (/容纳人数已满|人数已满|容量已满/.test(text)) return 'capacity-full';
     if (/仅限选一门|已达上限|不可选择/.test(text)) return 'category-limit';
     if (/上课时间冲突/.test(text)) return 'time-conflict';
-    if (/选课成功|成功选课/.test(text)) return 'course-selected';
+    if (/选课成功|成功选课|选择成功/.test(text)) return 'course-selected';
     return null;
   }
 
@@ -162,6 +162,29 @@
       hasSafeAction &&
       !/退选|替换|取消|放弃/.test(text)
     );
+  }
+
+  function safeModalAction(running, message = '', actionLabels = []) {
+    if (!running) return null;
+    if (shouldAutoContinueConflictModal(message, actionLabels)) {
+      return '确定选择';
+    }
+    const reason = knownAlertReason(message);
+    if (reason == null) return null;
+    return actionLabels.some(
+      (label) => String(label).replace(/\s+/g, '') === '确定',
+    )
+      ? '确定'
+      : null;
+  }
+
+  function shouldHandleModalOnce(activeModal, visibleModal) {
+    return visibleModal != null && activeModal !== visibleModal;
+  }
+
+  function modalAttemptDecision(visible, attempts, maxAttempts) {
+    if (!visible) return 'closed';
+    return attempts < maxAttempts ? 'retry' : 'stuck';
   }
 
   function chooseNextAttempt(
@@ -242,6 +265,15 @@
       if (element.style?.display === 'none' || element.style?.visibility === 'hidden') return false;
       return typeof element.getClientRects !== 'function' || element.getClientRects().length > 0;
     });
+  }
+
+  function isVisibleElement(element) {
+    if (element == null || element.hidden) return false;
+    if (element.getAttribute?.('aria-hidden') === 'true') return false;
+    if (element.style?.display === 'none' || element.style?.visibility === 'hidden') {
+      return false;
+    }
+    return typeof element.getClientRects !== 'function' || element.getClientRects().length > 0;
   }
 
   function findVisibleDialogText(document) {
@@ -349,6 +381,10 @@
     const storage = window.sessionStorage;
     const preferencesStorage = window.localStorage ?? storage;
     let observer = null;
+    let modalObserver = null;
+    let modalTimer = null;
+    let modalAction = null;
+    let modalRetryTimer = null;
     let refreshTimer = null;
     let verificationTimer = null;
     let attemptTimer = null;
@@ -488,9 +524,12 @@
       if (refreshTimer != null) window.clearTimeout(refreshTimer);
       if (verificationTimer != null) window.clearTimeout(verificationTimer);
       if (attemptTimer != null) window.clearTimeout(attemptTimer);
+      if (modalRetryTimer != null) window.clearTimeout(modalRetryTimer);
       refreshTimer = null;
       verificationTimer = null;
       attemptTimer = null;
+      modalRetryTimer = null;
+      modalAction = null;
       saveState();
       writeLog(`已暂停：${reason}`);
     }
@@ -513,25 +552,7 @@
         pause(`检测到 ${safetyReason}`);
         return null;
       }
-      const dialog = findVisibleDialog(document);
-      if (dialog != null) {
-        const actions = Array.from(document.querySelectorAll('button,input,a'));
-        const actionLabels = actions.map(actionLabel);
-        const dialogText = String(dialog.innerText || dialog.textContent || '');
-        if (
-          state.running &&
-          shouldAutoContinueConflictModal(dialogText, actionLabels)
-        ) {
-          const continueAction = actions.find(
-            (element) => actionLabel(element).replace(/\s+/g, '') === '确定选择',
-          );
-          writeLog('自动确认页面内上课时间冲突');
-          continueAction.click();
-          return null;
-        }
-        pause(`检测到未识别页面弹窗：${dialogText.slice(0, 80)}`);
-        return null;
-      }
+      if (processVisibleModal()) return null;
 
       const entries = scanEntries();
       if (entries.length === 0) {
@@ -551,6 +572,103 @@
         saveState();
       }
       return { entries, summary };
+    }
+
+    function processVisibleModal() {
+      if (!state.running) return false;
+      const dialog = findVisibleDialog(document);
+      if (dialog == null) {
+        clearModalAction();
+        return false;
+      }
+      if (modalAction?.dialog === dialog) return true;
+      clearModalAction();
+
+      const actions = Array.from(document.querySelectorAll('button,input,a')).filter(
+        isVisibleElement,
+      );
+      const actionLabels = actions.map(actionLabel);
+      const dialogText = String(dialog.innerText || dialog.textContent || '');
+      const targetLabel = safeModalAction(state.running, dialogText, actionLabels);
+      if (targetLabel == null) {
+        pause(`检测到未识别页面弹窗：${dialogText.slice(0, 80)}`);
+        return true;
+      }
+
+      const action = actions.find(
+        (element) => actionLabel(element).replace(/\s+/g, '') === targetLabel,
+      );
+      if (action == null) {
+        pause(`弹窗缺少安全确认按钮：${dialogText.slice(0, 80)}`);
+        return true;
+      }
+
+      modalAction = {
+        dialog,
+        targetLabel,
+        reason: knownAlertReason(dialogText),
+        attempts: 0,
+      };
+      clickModalAction();
+      return true;
+    }
+
+    function clearModalAction() {
+      if (modalRetryTimer != null) window.clearTimeout(modalRetryTimer);
+      modalRetryTimer = null;
+      modalAction = null;
+    }
+
+    function clickModalAction() {
+      if (modalAction == null || !state.running) return;
+      const visibleModal = findVisibleDialog(document);
+      const decision = modalAttemptDecision(
+        visibleModal === modalAction.dialog,
+        modalAction.attempts,
+        2,
+      );
+      if (decision === 'closed') {
+        const completedAction = modalAction;
+        clearModalAction();
+        if (
+          completedAction.targetLabel !== '确定选择' &&
+          completedAction.reason != null
+        ) {
+          handleKnownFeedback(completedAction.reason);
+        }
+        return;
+      }
+      if (decision === 'stuck') {
+        pause('确认按钮已重试 2 次但弹窗未关闭');
+        return;
+      }
+
+      const actions = Array.from(document.querySelectorAll('button,input,a')).filter(
+        isVisibleElement,
+      );
+      const action = actions.find(
+        (element) => actionLabel(element).replace(/\s+/g, '') === modalAction.targetLabel,
+      );
+      if (action == null) {
+        pause('确认按钮在重试时不可见');
+        return;
+      }
+
+      modalAction.attempts += 1;
+      if (modalAction.targetLabel === '确定选择') {
+        writeLog(`自动确认页面内上课时间冲突（${modalAction.attempts}/2）`);
+      } else {
+        writeLog(`自动确认页面内提示：${modalAction.reason}（${modalAction.attempts}/2）`);
+      }
+      try {
+        action.focus?.({ preventScroll: true });
+        action.click();
+      } catch {
+        pause('确认按钮点击失败');
+        return;
+      }
+
+      modalRetryTimer = window.setTimeout(() => clickModalAction(), 500);
     }
 
     function scheduleNormalRefresh() {
@@ -701,8 +819,26 @@
       observer.observe(table, { childList: true, subtree: true, characterData: true });
     }
 
+    function attachModalObserver() {
+      if (modalObserver != null || document.documentElement == null) return;
+      modalObserver = new window.MutationObserver(() => {
+        if (!state.running || modalTimer != null) return;
+        modalTimer = window.setTimeout(() => {
+          modalTimer = null;
+          processVisibleModal();
+        }, 0);
+      });
+      modalObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
+      });
+    }
+
     function preview() {
       attachObserver();
+      attachModalObserver();
       const snapshot = inspectPage();
       if (snapshot == null) return;
       state = {
@@ -735,6 +871,7 @@
       state = { ...state, running: true, pauseReason: '', lastMutationAt: Date.now() };
       saveState();
       attachObserver();
+      attachModalObserver();
       writeLog('开始监测；仅会使用当前页面的选课控件');
       runCycle();
     }
@@ -971,6 +1108,7 @@
       installDialogInterceptors();
       if ((state.previewed || state.running) && !requireFreshPreview()) return;
       attachObserver();
+      attachModalObserver();
       if (state.running) {
         writeLog('恢复当前标签的监测状态');
         runCycle();
@@ -1005,15 +1143,19 @@
     pageFingerprint,
     knownAlertReason,
     isSameCoursePage,
+    isVisibleElement,
+    modalAttemptDecision,
     normalizeExclusionRules,
     refreshDelayMs,
     refreshMsFromSeconds,
     releaseExpiredPending,
     reduceState,
     rowFromCells,
+    safeModalAction,
     shouldAutoAcceptConfirm,
     shouldAutoDismissAlert,
     shouldAutoContinueConflictModal,
+    shouldHandleModalOnce,
     shouldWaitForManualNext,
     shouldReload,
     scanDocument,
